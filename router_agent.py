@@ -255,7 +255,7 @@ def benchmark_all_models():
     print("\n[CONDUCTOR-AWS] Benchmarking models...")
     probe = "say hi in one word"
 
-    for name in models:
+    for name in models:  # each key: call CALLERS[name](...) to benchmark, then update models[name]
         try:
             _, latency, inp, out, tps = CALLERS[name](probe, max_tokens=16, temperature=0.1)
             latency_score = 1 / (latency + 0.01)
@@ -339,6 +339,7 @@ def chat(prompt: str, weights: dict) -> dict:
     print(f"[CONDUCTOR-AWS] Routing to → {chosen.upper()} (cooldown={get_benchmark_cooldown(weights):.0f}s)")
 
     try:
+        #Calls the chosen model with the generation config
         response, latency, inp, out, tps = CALLERS[chosen](
             prompt,
             max_tokens=gen_cfg["max_tokens"],
