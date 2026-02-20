@@ -12,6 +12,7 @@ import uvicorn
 
 from router_agent import benchmark_all_models, chat, models, consecutive_drops
 from metrics_store import load_all_metrics
+import router_agent
 
 
 @asynccontextmanager
@@ -43,6 +44,25 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "healthy"}
+
+
+@app.post("/enable_local")
+def enable_local():
+    router_agent.OLLAMA_ENABLED = True
+    # Benchmark local model now that it's enabled
+    if "local" in router_agent.CALLERS:
+        try:
+            _, latency, inp, out, tps = router_agent.CALLERS["local"]("say hi in one word", max_tokens=16, temperature=0.1)
+            from router_agent import calculate_cost_score, MODEL_PRICING
+            latency_score = 1 / (latency + 0.01)
+            cost_score    = calculate_cost_score("local", inp, out)
+            router_agent.models["local"]["latency"]     = round(latency_score, 3)
+            router_agent.models["local"]["cost"]        = cost_score
+            router_agent.models["local"]["reliability"] = 1.0
+            print(f"[CONDUCTOR-AWS] Local model benchmarked: latency={latency:.2f}s")
+        except Exception as e:
+            print(f"[CONDUCTOR-AWS] Local benchmark failed: {e}")
+    return {"enabled": True, "ollama_available": router_agent.OLLAMA_AVAILABLE}
 
 
 @app.post("/chat")

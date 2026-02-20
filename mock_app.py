@@ -333,21 +333,21 @@ HTML = """
 def index():
     return render_template_string(HTML)
 
-
 @app.route("/download_local", methods=["POST"])
 def download_local():
     try:
         result = subprocess.run(
             ["ollama", "pull", "qwen2:0.5b"],
-            capture_output=True, text=True, timeout=300
+            timeout=300
         )
         if result.returncode == 0:
+            requests.post(f"{CONDUCTOR_URL}/enable_local")
             return jsonify({"success": True})
         else:
-            return jsonify({"success": False, "error": result.stderr[:200]})
+            return jsonify({"success": False, "error": "ollama pull failed"})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
-
+    
 
 @app.route("/break/<model_name>", methods=["POST"])
 def break_model(model_name):

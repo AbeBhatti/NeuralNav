@@ -62,6 +62,10 @@ initial_scores    = {}
 consecutive_drops = {}
 last_benchmark_time = 0
 
+# Must be defined before score_models uses it
+OLLAMA_ENABLED    = False
+OLLAMA_AVAILABLE  = False
+
 # Initialize DB and load persisted metrics on module load
 init_db()
 _persisted = load_all_metrics()
@@ -78,7 +82,6 @@ else:
 def get_generation_config(weights: dict) -> dict:
     latency_w = weights.get("latency", 0.0)
     cost_w = weights.get("cost", 0.0)
-
     if latency_w >= 0.5:
         return {"max_tokens": 160, "temperature": 0.2}
     if latency_w >= 0.35:
@@ -89,20 +92,10 @@ def get_generation_config(weights: dict) -> dict:
 
 
 def get_benchmark_cooldown(weights):
-    """
-    Dynamic cooldown based on cost weight.
-    High cost priority → benchmark less often (save API calls).
-    Low cost priority  → benchmark aggressively (always fresh data).
-
-    Configurable per project type — e.g.:
-      - Fintech / cost-sensitive: set BASE=120, MAXIMUM=600
-      - Trading / latency-critical: set BASE=15, MAXIMUM=60
-    """
-    BASE    = 20   # seconds minimum  (kept low for demo)
-    MAXIMUM = 90   # seconds maximum  (kept low for demo)
-    cost_w  = weights.get("cost", 0)  # already normalized 0-1
-    cooldown = BASE + (cost_w * (MAXIMUM - BASE))
-    return cooldown
+    BASE    = 20
+    MAXIMUM = 90
+    cost_w  = weights.get("cost", 0)
+    return BASE + (cost_w * (MAXIMUM - BASE))
 
 
 def calculate_cost_score(model_name, input_tokens, output_tokens):
@@ -135,12 +128,17 @@ def report_to_datadog(model_name, latency, input_tokens, output_tokens, cost_usd
 
 
 def score_models(weights):
+    import router_agent
+    enabled = router_agent.OLLAMA_ENABLED
     scores = {}
     for name, metrics in models.items():
+        if name == "local" and not enabled:
+            scores[name] = 0
+            continue
         if metrics["latency"] is None or metrics["reliability"] is None or metrics["cost"] is None:
             scores[name] = 0
             continue
-        local_bonus = 0.3 if IS_LOCAL[name] else 0.0
+        local_bonus = 0.3 if IS_LOCAL.get(name, False) else 0.0
         score = (
             metrics["latency"]     * weights["latency"] +
             metrics["cost"]        * weights["cost"] +
@@ -218,7 +216,6 @@ def call_mistral(prompt, max_tokens: int = 512, temperature: float = 0.7):
 CALLERS = {"haiku": call_haiku, "llama3": call_llama3, "mistral": call_mistral}
 
 # ── Optional local Ollama model ────────────────────────────────────────────────
-OLLAMA_AVAILABLE = False
 try:
     import ollama as ollama_client
     ollama_client.chat(model="qwen2:0.5b", messages=[{"role": "user", "content": "hi"}])
@@ -247,9 +244,10 @@ try:
         return response["message"]["content"], latency, inp_tok, out_tok, tps
 
     CALLERS["local"] = call_local
-    OLLAMA_AVAILABLE = True
-    print("[CONDUCTOR-AWS] Ollama detected — local model (qwen2:0.5b) added to pool.")
+    OLLAMA_AVAILABLE = True  # detected but NOT enabled — user must click button
+    print("[CONDUCTOR-AWS] Ollama detected — local model available but disabled until user enables it.")
 except Exception:
+    OLLAMA_AVAILABLE = False
     print("[CONDUCTOR-AWS] Ollama not available — running cloud-only (3 Bedrock models).")
 
 
@@ -268,7 +266,13 @@ def benchmark_all_models():
     print("\n[CONDUCTOR-AWS] Benchmarking models...")
     probe = "say hi in one word"
 
-    for name in models:  # each key: call CALLERS[name](...) to benchmark, then update models[name]
+    # Only benchmark enabled models — skip local if not enabled
+    models_to_benchmark = {
+        name: m for name, m in models.items()
+        if name != "local" or OLLAMA_ENABLED
+    }
+
+    for name in models_to_benchmark:
         try:
             _, latency, inp, out, tps = CALLERS[name](probe, max_tokens=16, temperature=0.1)
             latency_score = 1 / (latency + 0.01)
@@ -339,7 +343,6 @@ def update_metrics(model_name, latency, success, inp, out, tps, weights):
     else:
         consecutive_drops[model_name] = 0
 
-    # Dynamic cooldown — high cost weight = benchmark less often
     cooldown = get_benchmark_cooldown(weights)
     cooldown_passed = (time.time() - last_benchmark_time) > cooldown
 
@@ -347,14 +350,34 @@ def update_metrics(model_name, latency, success, inp, out, tps, weights):
         print(f"\n[CONDUCTOR-AWS] {model_name} degraded. Cooldown was {cooldown:.0f}s. Re-benchmarking...")
         benchmark_all_models()
 
-
 def chat(prompt: str, weights: dict) -> dict:
-    chosen, scores = score_models(weights)
+    _, scores = score_models(weights)
     gen_cfg = get_generation_config(weights)
+
+    # Strands Agent makes the actual routing decision
+    scores_str = " | ".join(f"{k}: {round(v, 3)}" for k, v in scores.items())
+    valid_models = [k for k, v in scores.items() if v > 0]
+    routing_prompt = (
+        f"You are a routing agent. User priorities: latency={weights['latency']:.2f}, "
+        f"cost={weights['cost']:.2f}, reliability={weights['reliability']:.2f}. "
+        f"Real-time model scores: [{scores_str}]. "
+        f"User prompt: '{prompt}'. "
+        f"Pick the best model considering both the user's priorities AND the prompt content. "
+        f"Reply with ONLY the model name. Valid options: {valid_models}"
+    )
+    try:
+        agent_raw = str(strands_agent(routing_prompt)).strip().lower()
+        print(f"[DEBUG] Raw agent response: {repr(agent_raw)}")
+        chosen = next((name for name in valid_models if name in agent_raw), max(scores, key=scores.get))
+        print(f"[DEBUG] Chosen: {chosen}")
+        print(f"[CONDUCTOR-AWS] Strands Agent chose → {chosen.upper()}")
+    except Exception as e:
+        chosen = max(scores, key=scores.get)
+        print(f"[CONDUCTOR-AWS] Agent failed ({e}), score fallback → {chosen.upper()}")
+
     print(f"[CONDUCTOR-AWS] Routing to → {chosen.upper()} (cooldown={get_benchmark_cooldown(weights):.0f}s)")
 
     try:
-        #Calls the chosen model with the generation config
         response, latency, inp, out, tps = CALLERS[chosen](
             prompt,
             max_tokens=gen_cfg["max_tokens"],
@@ -362,14 +385,14 @@ def chat(prompt: str, weights: dict) -> dict:
         )
         update_metrics(chosen, latency, True, inp, out, tps, weights)
         return {
-            "response":         response,
-            "model_chosen":     chosen,
-            "scores":           {k: round(v, 3) for k, v in scores.items()},
-            "latency":          round(latency, 3),
-            "tokens":           {"input": inp, "output": out},
-            "ollama_available": OLLAMA_AVAILABLE,
+            "response":           response,
+            "model_chosen":       chosen,
+            "scores":             {k: round(v, 3) for k, v in scores.items()},
+            "latency":            round(latency, 3),
+            "tokens":             {"input": inp, "output": out},
+            "ollama_available":   OLLAMA_AVAILABLE,
             "benchmark_cooldown": round(get_benchmark_cooldown(weights)),
-            "generation":       gen_cfg,
+            "generation":         gen_cfg,
         }
 
     except Exception as e:
@@ -383,12 +406,12 @@ def chat(prompt: str, weights: dict) -> dict:
         )
         update_metrics(fallback, latency, True, inp, out, tps, weights)
         return {
-            "response":         response,
-            "model_chosen":     f"{fallback} (fallback from {chosen})",
-            "scores":           {k: round(v, 3) for k, v in scores.items()},
-            "latency":          round(latency, 3),
-            "tokens":           {"input": inp, "output": out},
-            "ollama_available": OLLAMA_AVAILABLE,
+            "response":           response,
+            "model_chosen":       f"{fallback} (fallback from {chosen})",
+            "scores":             {k: round(v, 3) for k, v in scores.items()},
+            "latency":            round(latency, 3),
+            "tokens":             {"input": inp, "output": out},
+            "ollama_available":   OLLAMA_AVAILABLE,
             "benchmark_cooldown": round(get_benchmark_cooldown(weights)),
-            "generation":       gen_cfg,
+            "generation":         gen_cfg,
         }
