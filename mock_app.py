@@ -12,9 +12,10 @@ New features:
 - Failure simulation buttons
 """
 
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, Response, stream_with_context
 import requests
 import subprocess
+import json
 
 app = Flask(__name__)
 
@@ -49,25 +50,66 @@ def summarize_with_local(history_text: str) -> str:
         return "\n".join(lines[-4:])
 
 
-def build_context(cost_w_normalized: float) -> str:
+def build_context(cost_w_normalized: float, latency_w_normalized: float):
     """
     Build conversation context to send with each prompt.
+    High latency weight → skip context entirely (fastest).
     High cost weight → summarize with local model (free).
     Low cost weight  → send raw last 3 turns (more accurate).
     """
     if not conversation_history:
-        return ""
+        return "", "no_history"
+
+    if latency_w_normalized >= 0.45:
+        return "", "latency_fast_path"
 
     history_text = "\n".join(conversation_history)
 
     if cost_w_normalized >= 0.4:
         # Cost-conscious: use local model to compress history
         summary = summarize_with_local(history_text)
-        return f"[Conversation summary]: {summary}\n\n"
+        return f"[Conversation summary]: {summary}\n\n", "local_summary"
     else:
         # Latency/quality focused: send raw recent history
         recent = "\n".join(conversation_history[-6:])
-        return f"[Recent conversation]:\n{recent}\n\n"
+        return f"[Recent conversation]:\n{recent}\n\n", "raw_recent"
+
+
+def process_chat_request(body):
+    prompt = body.get("prompt", "")
+    latency_w = body.get("latency_w", DEFAULT_WEIGHTS["latency_w"])
+    cost_w = body.get("cost_w", DEFAULT_WEIGHTS["cost_w"])
+    reliability_w = body.get("reliability_w", DEFAULT_WEIGHTS["reliability_w"])
+    local_pref_w = body.get("local_pref_w", DEFAULT_WEIGHTS["local_pref_w"])
+
+    total = latency_w + cost_w + reliability_w + local_pref_w
+    cost_w_normalized = cost_w / total if total > 0 else 0
+    latency_w_normalized = latency_w / total if total > 0 else 0
+
+    context, context_mode = build_context(cost_w_normalized, latency_w_normalized)
+    full_prompt = f"{context}User: {prompt}" if context else prompt
+
+    conversation_history.append(f"User: {prompt}")
+
+    payload = {
+        "prompt": full_prompt,
+        "latency_w": latency_w,
+        "cost_w": cost_w,
+        "reliability_w": reliability_w,
+        "local_pref_w": local_pref_w,
+    }
+
+    response = requests.post(f"{CONDUCTOR_URL}/chat", json=payload)
+    data = response.json()
+    data["context_mode"] = context_mode
+
+    conversation_history.append(f"Assistant: {data.get('response', '')}")
+
+    if len(conversation_history) > 20:
+        conversation_history.pop(0)
+        conversation_history.pop(0)
+
+    return data
 
 
 HTML = """
@@ -226,43 +268,61 @@ HTML = """
             chat.innerHTML += `<div class="message" id="thinking"><span style="color:#444">⏳ Conductor routing...</span></div>`;
             chat.scrollTop = chat.scrollHeight;
 
-            const res = await fetch('/ask', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({prompt, ...weights})
+            const params = new URLSearchParams({ prompt, ...weights });
+            const evt = new EventSource('/ask_stream?' + params.toString());
+
+            evt.addEventListener('status', (event) => {
+                const status = JSON.parse(event.data);
+                const thinkEl = document.getElementById('thinking');
+                if (thinkEl) {
+                    thinkEl.innerHTML = `<span style="color:#666">⏳ ${status.message}</span>`;
+                }
             });
-            const data = await res.json();
-            document.getElementById('thinking').remove();
 
-            const isFallback = data.model_chosen && data.model_chosen.includes('fallback');
-            const badgeClass = isFallback ? 'model-badge fallback' : 'model-badge';
-            const scoreStr = Object.entries(data.scores || {})
-                .map(([k, v]) => `${k}: ${v}`)
-                .join(' · ');
+            evt.addEventListener('final', (event) => {
+                const data = JSON.parse(event.data);
+                const thinkEl = document.getElementById('thinking');
+                if (thinkEl) thinkEl.remove();
 
-            const memoryMode = costW >= 5
-                ? '🖥 memory: local summarization (free)'
-                : '☁️ memory: raw context (accurate)';
+                const isFallback = data.model_chosen && data.model_chosen.includes('fallback');
+                const badgeClass = isFallback ? 'model-badge fallback' : 'model-badge';
+                const scoreStr = Object.entries(data.scores || {})
+                    .map(([k, v]) => `${k}: ${v}`)
+                    .join(' · ');
 
-            chat.innerHTML += `
-                <div class="message">
-                    <span class="assistant">Assistant:</span> ${data.response}
-                    <div class="meta">
-                        <span class="${badgeClass}">→ ${data.model_chosen}</span>
-                        <span class="latency-badge">${data.latency}s</span>
-                        <span class="cooldown-badge">⏱ benchmark every ${data.benchmark_cooldown}s</span>
-                        <div class="scores">scores: ${scoreStr}</div>
-                        <div class="memory-tag">${memoryMode}</div>
-                    </div>
-                </div>`;
-            chat.scrollTop = chat.scrollHeight;
+                let memoryMode = '☁️ memory: raw context (accurate)';
+                if (data.context_mode === 'local_summary') memoryMode = '🖥 memory: local summarization (free)';
+                if (data.context_mode === 'latency_fast_path') memoryMode = '⚡ memory: skipped for speed';
 
-            if (data.ollama_available && localRow.style.display === 'none') {
-                localRow.style.display = 'flex';
-                document.getElementById('dl-status').textContent = '✅ Local model detected!';
-                document.getElementById('dl-btn').textContent = '✅ Local Model Active';
-                document.getElementById('dl-btn').disabled = true;
-            }
+                chat.innerHTML += `
+                    <div class="message">
+                        <span class="assistant">Assistant:</span> ${data.response}
+                        <div class="meta">
+                            <span class="${badgeClass}">→ ${data.model_chosen}</span>
+                            <span class="latency-badge">${data.latency}s</span>
+                            <span class="cooldown-badge">⏱ benchmark every ${data.benchmark_cooldown}s</span>
+                            <div class="scores">scores: ${scoreStr}</div>
+                            <div class="memory-tag">${memoryMode}</div>
+                        </div>
+                    </div>`;
+                chat.scrollTop = chat.scrollHeight;
+
+                if (data.ollama_available && localRow.style.display === 'none') {
+                    localRow.style.display = 'flex';
+                    document.getElementById('dl-status').textContent = '✅ Local model detected!';
+                    document.getElementById('dl-btn').textContent = '✅ Local Model Active';
+                    document.getElementById('dl-btn').disabled = true;
+                }
+
+                evt.close();
+            });
+
+            evt.addEventListener('error', () => {
+                const thinkEl = document.getElementById('thinking');
+                if (thinkEl) thinkEl.remove();
+                chat.innerHTML += `<div class="message"><span style="color:#f87171">Request failed.</span></div>`;
+                evt.close();
+            });
         }
     </script>
 </body>
@@ -303,42 +363,30 @@ def restore_all():
 
 @app.route("/ask", methods=["POST"])
 def ask():
-    body    = request.json
-    prompt  = body.get("prompt", "")
-    cost_w  = body.get("cost_w", DEFAULT_WEIGHTS["cost_w"])
+    return jsonify(process_chat_request(request.json))
 
-    # Normalize cost weight for memory decision (same normalization as api.py)
-    total = (body.get("latency_w", 5) + cost_w +
-             body.get("reliability_w", 2) + body.get("local_pref_w", 0))
-    cost_w_normalized = cost_w / total if total > 0 else 0
 
-    # Build shared context — method depends on cost priority
-    context = build_context(cost_w_normalized)
-    full_prompt = f"{context}User: {prompt}" if context else prompt
-
-    # Store in shared memory
-    conversation_history.append(f"User: {prompt}")
-
-    payload = {
-        "prompt":        full_prompt,
-        "latency_w":     body.get("latency_w",     DEFAULT_WEIGHTS["latency_w"]),
-        "cost_w":        cost_w,
-        "reliability_w": body.get("reliability_w",  DEFAULT_WEIGHTS["reliability_w"]),
-        "local_pref_w":  body.get("local_pref_w",   DEFAULT_WEIGHTS["local_pref_w"]),
+@app.route("/ask_stream", methods=["GET"])
+def ask_stream():
+    body = {
+        "prompt": request.args.get("prompt", ""),
+        "latency_w": int(request.args.get("latency_w", DEFAULT_WEIGHTS["latency_w"])),
+        "cost_w": int(request.args.get("cost_w", DEFAULT_WEIGHTS["cost_w"])),
+        "reliability_w": int(request.args.get("reliability_w", DEFAULT_WEIGHTS["reliability_w"])),
+        "local_pref_w": int(request.args.get("local_pref_w", DEFAULT_WEIGHTS["local_pref_w"])),
     }
 
-    response = requests.post(f"{CONDUCTOR_URL}/chat", json=payload)
-    data = response.json()
+    @stream_with_context
+    def generate():
+        yield f"event: status\ndata: {json.dumps({'message': 'Routing request...'})}\n\n"
+        yield f"event: status\ndata: {json.dumps({'message': 'Calling selected model...'})}\n\n"
+        try:
+            data = process_chat_request(body)
+            yield f"event: final\ndata: {json.dumps(data)}\n\n"
+        except Exception as e:
+            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
 
-    # Store assistant response in shared memory
-    conversation_history.append(f"Assistant: {data.get('response', '')}")
-
-    # Keep memory bounded — last 20 turns max
-    if len(conversation_history) > 20:
-        conversation_history.pop(0)
-        conversation_history.pop(0)
-
-    return jsonify(data)
+    return Response(generate(), mimetype="text/event-stream")
 
 
 if __name__ == "__main__":

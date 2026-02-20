@@ -62,6 +62,19 @@ consecutive_drops = {}
 last_benchmark_time = 0
 
 
+def get_generation_config(weights: dict) -> dict:
+    latency_w = weights.get("latency", 0.0)
+    cost_w = weights.get("cost", 0.0)
+
+    if latency_w >= 0.5:
+        return {"max_tokens": 160, "temperature": 0.2}
+    if latency_w >= 0.35:
+        return {"max_tokens": 256, "temperature": 0.4}
+    if cost_w >= 0.45:
+        return {"max_tokens": 220, "temperature": 0.5}
+    return {"max_tokens": 512, "temperature": 0.7}
+
+
 def get_benchmark_cooldown(weights):
     """
     Dynamic cooldown based on cost weight.
@@ -125,10 +138,11 @@ def score_models(weights):
     return max(scores, key=scores.get), scores
 
 
-def _invoke_haiku(prompt: str):
+def _invoke_haiku(prompt: str, max_tokens: int = 512, temperature: float = 0.7):
     body = json.dumps({
         "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 512,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
         "messages": [{"role": "user", "content": prompt}]
     })
     start   = time.time()
@@ -142,11 +156,11 @@ def _invoke_haiku(prompt: str):
     return text, latency, inp_tok, out_tok, tps
 
 
-def _invoke_llama3(prompt: str):
+def _invoke_llama3(prompt: str, max_tokens: int = 512, temperature: float = 0.7):
     body = json.dumps({
         "prompt": f"<|begin_of_text|><|user|>\n{prompt}\n<|assistant|>\n",
-        "max_gen_len": 512,
-        "temperature": 0.7,
+        "max_gen_len": max_tokens,
+        "temperature": temperature,
     })
     start   = time.time()
     resp    = bedrock.invoke_model(modelId=MODEL_IDS["llama3"], body=body)
@@ -159,11 +173,11 @@ def _invoke_llama3(prompt: str):
     return text, latency, inp_tok, out_tok, tps
 
 
-def _invoke_mistral(prompt: str):
+def _invoke_mistral(prompt: str, max_tokens: int = 512, temperature: float = 0.7):
     body = json.dumps({
         "prompt": f"<s>[INST] {prompt} [/INST]",
-        "max_tokens": 512,
-        "temperature": 0.7,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
     })
     start   = time.time()
     resp    = bedrock.invoke_model(modelId=MODEL_IDS["mistral"], body=body)
@@ -177,16 +191,16 @@ def _invoke_mistral(prompt: str):
 
 
 @llm(model_provider="bedrock", model_name="claude-3-haiku")
-def call_haiku(prompt):
-    return _invoke_haiku(prompt)
+def call_haiku(prompt, max_tokens: int = 512, temperature: float = 0.7):
+    return _invoke_haiku(prompt, max_tokens=max_tokens, temperature=temperature)
 
 @llm(model_provider="bedrock", model_name="llama3-8b")
-def call_llama3(prompt):
-    return _invoke_llama3(prompt)
+def call_llama3(prompt, max_tokens: int = 512, temperature: float = 0.7):
+    return _invoke_llama3(prompt, max_tokens=max_tokens, temperature=temperature)
 
 @llm(model_provider="bedrock", model_name="mistral-7b")
-def call_mistral(prompt):
-    return _invoke_mistral(prompt)
+def call_mistral(prompt, max_tokens: int = 512, temperature: float = 0.7):
+    return _invoke_mistral(prompt, max_tokens=max_tokens, temperature=temperature)
 
 CALLERS = {"haiku": call_haiku, "llama3": call_llama3, "mistral": call_mistral}
 
@@ -206,11 +220,12 @@ try:
     }
 
     @llm(model_provider="ollama", model_name="qwen2:0.5b")
-    def call_local(prompt):
+    def call_local(prompt, max_tokens: int = 512, temperature: float = 0.7):
         start    = time.time()
         response = ollama_client.chat(
             model="qwen2:0.5b",
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
+            options={"num_predict": max_tokens, "temperature": temperature}
         )
         latency  = time.time() - start
         inp_tok  = response.get("prompt_eval_count", 0)
@@ -242,7 +257,7 @@ def benchmark_all_models():
 
     for name in models:
         try:
-            _, latency, inp, out, tps = CALLERS[name](probe)
+            _, latency, inp, out, tps = CALLERS[name](probe, max_tokens=16, temperature=0.1)
             latency_score = 1 / (latency + 0.01)
             cost_score    = calculate_cost_score(name, inp, out)
             cost_usd      = ((inp + out) / 1_000_000) * MODEL_PRICING[name]
@@ -320,10 +335,15 @@ def update_metrics(model_name, latency, success, inp, out, tps, weights):
 
 def chat(prompt: str, weights: dict) -> dict:
     chosen, scores = score_models(weights)
+    gen_cfg = get_generation_config(weights)
     print(f"[CONDUCTOR-AWS] Routing to → {chosen.upper()} (cooldown={get_benchmark_cooldown(weights):.0f}s)")
 
     try:
-        response, latency, inp, out, tps = CALLERS[chosen](prompt)
+        response, latency, inp, out, tps = CALLERS[chosen](
+            prompt,
+            max_tokens=gen_cfg["max_tokens"],
+            temperature=gen_cfg["temperature"]
+        )
         update_metrics(chosen, latency, True, inp, out, tps, weights)
         return {
             "response":         response,
@@ -333,13 +353,18 @@ def chat(prompt: str, weights: dict) -> dict:
             "tokens":           {"input": inp, "output": out},
             "ollama_available": OLLAMA_AVAILABLE,
             "benchmark_cooldown": round(get_benchmark_cooldown(weights)),
+            "generation":       gen_cfg,
         }
 
     except Exception as e:
         print(f"[CONDUCTOR-AWS] {chosen} failed: {e}. Falling back...")
         update_metrics(chosen, 99, False, 0, 0, 0, weights)
         fallback = "mistral" if chosen != "mistral" else "haiku"
-        response, latency, inp, out, tps = CALLERS[fallback](prompt)
+        response, latency, inp, out, tps = CALLERS[fallback](
+            prompt,
+            max_tokens=gen_cfg["max_tokens"],
+            temperature=gen_cfg["temperature"]
+        )
         update_metrics(fallback, latency, True, inp, out, tps, weights)
         return {
             "response":         response,
@@ -349,4 +374,5 @@ def chat(prompt: str, weights: dict) -> dict:
             "tokens":           {"input": inp, "output": out},
             "ollama_available": OLLAMA_AVAILABLE,
             "benchmark_cooldown": round(get_benchmark_cooldown(weights)),
+            "generation":       gen_cfg,
         }
