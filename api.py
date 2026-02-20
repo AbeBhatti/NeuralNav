@@ -11,12 +11,16 @@ from contextlib import asynccontextmanager
 import uvicorn
 
 from router_agent import benchmark_all_models, chat, models, consecutive_drops
+from metrics_store import load_all_metrics
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[CONDUCTOR-AWS] Starting up — running initial benchmark...")
-    benchmark_all_models()
+    if load_all_metrics():
+        print("[CONDUCTOR-AWS] Starting up — warm start from persisted metrics. Skipping benchmark.")
+    else:
+        print("[CONDUCTOR-AWS] Starting up — no fresh metrics found. Running initial benchmark...")
+        benchmark_all_models()
     print("[CONDUCTOR-AWS] Ready to route requests.")
     yield
 

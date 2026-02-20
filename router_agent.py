@@ -13,6 +13,7 @@ from ddtrace.llmobs.decorators import llm
 from datadog import initialize, statsd
 from strands import Agent
 from strands.models.bedrock import BedrockModel
+from metrics_store import init_db, save_metrics, load_all_metrics, save_benchmark_time, load_benchmark_time
 
 LLMObs.enable(
     ml_app="conductor",
@@ -60,6 +61,18 @@ models = {
 initial_scores    = {}
 consecutive_drops = {}
 last_benchmark_time = 0
+
+# Initialize DB and load persisted metrics on module load
+init_db()
+_persisted = load_all_metrics()
+if _persisted:
+    for _name, _saved in _persisted.items():
+        if _name in models:
+            models[_name].update(_saved)
+    last_benchmark_time = load_benchmark_time()
+    print(f"[CONDUCTOR-AWS] Loaded persisted metrics for: {list(_persisted.keys())}")
+else:
+    print("[CONDUCTOR-AWS] No fresh persisted metrics — will benchmark on startup.")
 
 
 def get_generation_config(weights: dict) -> dict:
@@ -280,6 +293,8 @@ def benchmark_all_models():
     for name, metrics in models.items():
         initial_scores[name]    = metrics["latency"] or 0
         consecutive_drops[name] = 0
+        save_metrics(name, metrics)
+    save_benchmark_time(last_benchmark_time)
 
     print("[CONDUCTOR-AWS] Benchmark complete.\n")
 
