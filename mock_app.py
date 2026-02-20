@@ -7,12 +7,12 @@ is a drop-in replacement for any LLM-powered project.
 
 from flask import Flask, request, jsonify, render_template_string
 import requests
+import subprocess
 
 app = Flask(__name__)
 
-CONDUCTOR_URL = "http://localhost:8000/chat"
+CONDUCTOR_URL = "http://localhost:8000"
 
-# ── Default weights (can be changed live via the UI) ──────────────────────────
 DEFAULT_WEIGHTS = {
     "latency_w":     5,
     "cost_w":        3,
@@ -20,103 +20,190 @@ DEFAULT_WEIGHTS = {
     "local_pref_w":  0,
 }
 
-# ── Simple chat UI ─────────────────────────────────────────────────────────────
 HTML = """
 <!DOCTYPE html>
 <html>
 <head>
     <title>NeuralNav Assistant (powered by Conductor)</title>
     <style>
-        body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #0f0f0f; color: #eee; }
-        h1 { color: #7c3aed; }
-        .subtitle { color: #888; margin-top: -10px; font-size: 14px; }
+        body { font-family: sans-serif; max-width: 860px; margin: 40px auto; padding: 0 20px; background: #0f0f0f; color: #eee; }
+        h1 { color: #7c3aed; margin-bottom: 4px; }
+        .subtitle { color: #888; margin-top: 0; font-size: 14px; margin-bottom: 20px; }
         .chat-box { background: #1a1a1a; border-radius: 10px; padding: 20px; min-height: 300px; margin: 20px 0; }
-        .message { margin: 12px 0; }
-        .user { color: #60a5fa; }
-        .assistant { color: #34d399; }
-        .meta { color: #888; font-size: 12px; margin-top: 4px; }
-        input[type=text] { width: 100%; padding: 10px; background: #1a1a1a; border: 1px solid #333; color: #eee; border-radius: 6px; font-size: 15px; }
-        button { padding: 10px 20px; background: #7c3aed; color: white; border: none; border-radius: 6px; cursor: pointer; margin-top: 8px; }
-        button:hover { background: #6d28d9; }
-        .weights { background: #1a1a1a; border-radius: 10px; padding: 16px; margin-bottom: 20px; }
-        .weights h3 { margin-top: 0; color: #a78bfa; }
+        .message { margin: 14px 0; line-height: 1.5; }
+        .user { color: #60a5fa; font-weight: bold; }
+        .assistant { color: #34d399; font-weight: bold; }
+        .meta { color: #888; font-size: 12px; margin-top: 6px; padding: 6px 10px; background: #111; border-radius: 6px; display: inline-block; }
+        .model-badge { display: inline-block; background: #7c3aed; color: white; padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; margin-right: 6px; }
+        .model-badge.fallback { background: #b45309; }
+        .latency-badge { display: inline-block; background: #1e3a2f; color: #34d399; padding: 3px 8px; border-radius: 12px; font-size: 11px; }
+        input[type=text] { width: 100%; padding: 10px; background: #1a1a1a; border: 1px solid #333; color: #eee; border-radius: 6px; font-size: 15px; box-sizing: border-box; }
+        .send-btn { padding: 10px 24px; background: #7c3aed; color: white; border: none; border-radius: 6px; cursor: pointer; margin-top: 8px; font-size: 15px; }
+        .send-btn:hover { background: #6d28d9; }
+        .panel { background: #1a1a1a; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+        .panel h3 { margin-top: 0; color: #a78bfa; font-size: 14px; }
         .weight-row { display: flex; align-items: center; gap: 12px; margin: 8px 0; }
-        .weight-row label { width: 120px; font-size: 13px; color: #aaa; }
-        .weight-row input[type=range] { flex: 1; }
-        .weight-row span { width: 20px; text-align: right; font-size: 13px; }
-        .badge { display: inline-block; background: #7c3aed; color: white; padding: 2px 8px; border-radius: 4px; font-size: 11px; margin-left: 8px; }
+        .weight-row label { width: 140px; font-size: 13px; color: #aaa; }
+        .weight-row input[type=range] { flex: 1; accent-color: #7c3aed; }
+        .weight-row span { width: 20px; text-align: right; font-size: 13px; color: #eee; }
+        .local-section { margin-top: 14px; padding-top: 14px; border-top: 1px solid #333; }
+        .download-btn { padding: 8px 16px; background: #1e3a2f; color: #34d399; border: 1px solid #34d399; border-radius: 6px; cursor: pointer; font-size: 13px; }
+        .download-btn:hover { background: #34d399; color: #000; }
+        .download-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .dl-status { font-size: 12px; color: #888; margin-left: 10px; }
+        #local-row { display: none; }
+        .scores { font-size: 11px; color: #555; margin-top: 3px; }
+        .break-btns { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+        .break-btn { padding: 7px 14px; background: #3a1e1e; color: #f87171; border: 1px solid #f87171; border-radius: 6px; cursor: pointer; font-size: 12px; }
+        .break-btn:hover { background: #f87171; color: #000; }
+        .restore-btn { padding: 7px 14px; background: #1e2a3a; color: #60a5fa; border: 1px solid #60a5fa; border-radius: 6px; cursor: pointer; font-size: 12px; }
+        .restore-btn:hover { background: #60a5fa; color: #000; }
+        .break-status { font-size: 12px; margin-top: 8px; min-height: 18px; }
     </style>
 </head>
 <body>
     <h1>NeuralNav Assistant</h1>
-    <p class="subtitle">Powered by <strong>Conductor</strong> — intelligent LLM routing via AWS Bedrock</p>
+    <p class="subtitle">Powered by <strong>Conductor</strong> — intelligent LLM routing via AWS Bedrock + Strands Agents</p>
 
-    <div class="weights">
-        <h3>Routing Weights (change live)</h3>
+    <!-- Routing weights -->
+    <div class="panel">
+        <h3>⚡ Routing Weights (drag to switch models live)</h3>
         <div class="weight-row">
-            <label>Latency</label>
+            <label>🚀 Latency</label>
             <input type="range" id="latency_w" min="0" max="10" value="5">
             <span id="latency_val">5</span>
         </div>
         <div class="weight-row">
-            <label>Cost</label>
+            <label>💰 Cost</label>
             <input type="range" id="cost_w" min="0" max="10" value="3">
             <span id="cost_val">3</span>
         </div>
         <div class="weight-row">
-            <label>Reliability</label>
+            <label>🛡 Reliability</label>
             <input type="range" id="reliability_w" min="0" max="10" value="2">
             <span id="reliability_val">2</span>
         </div>
+
+        <div class="local-section">
+            <button class="download-btn" id="dl-btn" onclick="downloadLocal()">⬇ Add Local Model (qwen2:0.5b)</button>
+            <span class="dl-status" id="dl-status"></span>
+            <div class="weight-row" id="local-row" style="margin-top:10px;">
+                <label>🖥 Local Preference</label>
+                <input type="range" id="local_pref_w" min="0" max="10" value="5">
+                <span id="local_val">5</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Failure simulation -->
+    <div class="panel">
+        <h3>💥 Simulate Model Failure (demo)</h3>
+        <div class="break-btns">
+            <button class="break-btn" onclick="breakModel('haiku')">💥 Break Haiku</button>
+            <button class="break-btn" onclick="breakModel('llama3')">💥 Break Llama3</button>
+            <button class="break-btn" onclick="breakModel('mistral')">💥 Break Mistral</button>
+            <button class="restore-btn" onclick="restoreAll()">🔄 Restore All</button>
+        </div>
+        <div class="break-status" id="break-status"></div>
     </div>
 
     <div class="chat-box" id="chat"></div>
 
     <input type="text" id="prompt" placeholder="Ask anything..." onkeydown="if(event.key==='Enter') send()">
-    <button onclick="send()">Send</button>
+    <button class="send-btn" onclick="send()">Send →</button>
 
     <script>
-        // Update slider labels
-        ['latency', 'cost', 'reliability'].forEach(k => {
-            document.getElementById(k+'_w').addEventListener('input', function() {
-                document.getElementById(k+'_val').textContent = this.value;
+        ['latency', 'cost', 'reliability', 'local_pref'].forEach(k => {
+            const el = document.getElementById(k + '_w');
+            if (el) el.addEventListener('input', function() {
+                document.getElementById(k + '_val').textContent = this.value;
             });
         });
+
+        async function downloadLocal() {
+            const btn = document.getElementById('dl-btn');
+            const status = document.getElementById('dl-status');
+            btn.disabled = true;
+            status.textContent = 'Pulling qwen2:0.5b... (may take a minute)';
+            const res = await fetch('/download_local', { method: 'POST' });
+            const data = await res.json();
+            if (data.success) {
+                status.textContent = '✅ Local model ready!';
+                document.getElementById('local-row').style.display = 'flex';
+                btn.textContent = '✅ Local Model Active';
+            } else {
+                status.textContent = '❌ Failed: ' + data.error;
+                btn.disabled = false;
+            }
+        }
+
+        async function breakModel(name) {
+            const status = document.getElementById('break-status');
+            status.style.color = '#f87171';
+            status.textContent = `💥 Breaking ${name}...`;
+            await fetch('/break/' + name, { method: 'POST' });
+            status.textContent = `⚠️ ${name} degraded! Send a message to watch Conductor reroute automatically.`;
+        }
+
+        async function restoreAll() {
+            const status = document.getElementById('break-status');
+            status.style.color = '#60a5fa';
+            status.textContent = '🔄 Re-benchmarking all models...';
+            await fetch('/restore/all', { method: 'POST' });
+            status.textContent = '✅ All models restored and re-benchmarked!';
+        }
 
         async function send() {
             const prompt = document.getElementById('prompt').value.trim();
             if (!prompt) return;
 
+            const localRow = document.getElementById('local-row');
+            const localActive = localRow.style.display !== 'none';
+
             const weights = {
                 latency_w:     parseInt(document.getElementById('latency_w').value),
                 cost_w:        parseInt(document.getElementById('cost_w').value),
                 reliability_w: parseInt(document.getElementById('reliability_w').value),
-                local_pref_w:  0
+                local_pref_w:  localActive ? parseInt(document.getElementById('local_pref_w').value) : 0,
             };
 
-            // Show user message
             const chat = document.getElementById('chat');
             chat.innerHTML += `<div class="message"><span class="user">You:</span> ${prompt}</div>`;
             document.getElementById('prompt').value = '';
+            chat.innerHTML += `<div class="message" id="thinking"><span style="color:#444">⏳ Conductor routing...</span></div>`;
+            chat.scrollTop = chat.scrollHeight;
 
-            // Call Conductor
             const res = await fetch('/ask', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({prompt, ...weights})
             });
             const data = await res.json();
+            document.getElementById('thinking').remove();
+
+            const isFallback = data.model_chosen && data.model_chosen.includes('fallback');
+            const badgeClass = isFallback ? 'model-badge fallback' : 'model-badge';
+            const scoreStr = Object.entries(data.scores || {})
+                .map(([k, v]) => `${k}: ${v}`)
+                .join(' · ');
 
             chat.innerHTML += `
                 <div class="message">
                     <span class="assistant">Assistant:</span> ${data.response}
                     <div class="meta">
-                        Routed to <strong>${data.model_chosen}</strong>
-                        <span class="badge">${data.latency}s</span>
-                        &nbsp;scores: haiku=${data.scores.haiku} · llama3=${data.scores.llama3} · mistral=${data.scores.mistral}
+                        <span class="${badgeClass}">→ ${data.model_chosen}</span>
+                        <span class="latency-badge">${data.latency}s</span>
+                        <div class="scores">scores: ${scoreStr}</div>
                     </div>
                 </div>`;
             chat.scrollTop = chat.scrollHeight;
+
+            if (data.ollama_available && localRow.style.display === 'none') {
+                localRow.style.display = 'flex';
+                document.getElementById('dl-status').textContent = '✅ Local model detected!';
+                document.getElementById('dl-btn').textContent = '✅ Local Model Active';
+                document.getElementById('dl-btn').disabled = true;
+            }
         }
     </script>
 </body>
@@ -128,16 +215,39 @@ def index():
     return render_template_string(HTML)
 
 
+@app.route("/download_local", methods=["POST"])
+def download_local():
+    try:
+        result = subprocess.run(
+            ["ollama", "pull", "qwen2:0.5b"],
+            capture_output=True, text=True, timeout=300
+        )
+        if result.returncode == 0:
+            return jsonify({"success": True})
+        else:
+            return jsonify({"success": False, "error": result.stderr[:200]})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route("/break/<model_name>", methods=["POST"])
+def break_model(model_name):
+    res = requests.post(f"{CONDUCTOR_URL}/break/{model_name}")
+    return jsonify(res.json())
+
+
+@app.route("/restore/all", methods=["POST"])
+def restore_all():
+    # Restore each model by hitting the restore endpoint for any one of them
+    # (restore triggers full re-benchmark)
+    res = requests.post(f"{CONDUCTOR_URL}/restore/haiku")
+    return jsonify(res.json())
+
+
 @app.route("/ask", methods=["POST"])
 def ask():
-    """
-    This is where a normal app would call OpenAI.
-    We call Conductor instead — zero other changes needed.
-    """
-    body = request.json
-    prompt = body.get("prompt", "")
-
-    # Pass weights through to Conductor
+    body    = request.json
+    prompt  = body.get("prompt", "")
     payload = {
         "prompt":        prompt,
         "latency_w":     body.get("latency_w",     DEFAULT_WEIGHTS["latency_w"]),
@@ -145,12 +255,11 @@ def ask():
         "reliability_w": body.get("reliability_w",  DEFAULT_WEIGHTS["reliability_w"]),
         "local_pref_w":  body.get("local_pref_w",   DEFAULT_WEIGHTS["local_pref_w"]),
     }
-
-    response = requests.post(CONDUCTOR_URL, json=payload)
+    response = requests.post(f"{CONDUCTOR_URL}/chat", json=payload)
     return jsonify(response.json())
 
 
 if __name__ == "__main__":
-    print("Mock NeuralNav app running at http://localhost:5001")
+    print("Mock NeuralNav app running at http://localhost:5005")
     print("Conductor endpoint:", CONDUCTOR_URL)
     app.run(port=5005, debug=True)

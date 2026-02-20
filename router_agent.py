@@ -14,7 +14,6 @@ from datadog import initialize, statsd
 from strands import Agent
 from strands.models.bedrock import BedrockModel
 
-# ── Datadog init (mirrors router.py exactly) ───────────────────────────────────
 LLMObs.enable(
     ml_app="conductor",
     api_key=os.getenv("DD_API_KEY"),
@@ -31,17 +30,15 @@ initialize(
 statsd.host = "localhost"
 statsd.port = 8125
 
-# ── Bedrock client ─────────────────────────────────────────────────────────────
 bedrock = boto3.client("bedrock-runtime", region_name=os.getenv("AWS_REGION", "us-west-2"))
 
-# ── Model catalogue (replaces Groq/Cohere/Ollama) ─────────────────────────────
 MODEL_IDS = {
     "haiku":   "anthropic.claude-3-haiku-20240307-v1:0",
     "llama3":  "meta.llama3-8b-instruct-v1:0",
     "mistral": "mistral.mistral-7b-instruct-v0:2",
 }
 
-MODEL_PRICING = {          # USD per 1M tokens (input)
+MODEL_PRICING = {
     "haiku":   0.25,
     "llama3":  0.30,
     "mistral": 0.15,
@@ -65,8 +62,6 @@ consecutive_drops = {}
 REBENCHMARK_COOLDOWN = 60
 last_benchmark_time  = 0
 
-
-# ── Helpers (identical formula to router.py) ───────────────────────────────────
 
 def calculate_cost_score(model_name, input_tokens, output_tokens):
     global max_cost_per_call
@@ -103,18 +98,16 @@ def score_models(weights):
         if metrics["latency"] is None or metrics["reliability"] is None or metrics["cost"] is None:
             scores[name] = 0
             continue
-        local_bonus = 1.0 if IS_LOCAL[name] else 0.0
+        local_bonus = 0.3 if IS_LOCAL[name] else 0.0
         score = (
             metrics["latency"]      * weights["latency"] +
             metrics["cost"]         * weights["cost"] +
             metrics["reliability"]  * weights["reliability"] +
-            local_bonus             * weights["local_pref"]
+            local_bonus             * weights.get("local_pref", 0)
         )
         scores[name] = score
     return max(scores, key=scores.get), scores
 
-
-# ── Bedrock call wrappers ──────────────────────────────────────────────────────
 
 def _invoke_haiku(prompt: str):
     body = json.dumps({
@@ -144,7 +137,7 @@ def _invoke_llama3(prompt: str):
     latency = time.time() - start
     out     = json.loads(resp["body"].read())
     text    = out["generation"]
-    inp_tok = len(prompt) // 4          # Llama3 doesn't return token counts
+    inp_tok = len(prompt) // 4
     out_tok = len(text) // 4
     tps     = out_tok / latency if latency > 0 else 0
     return text, latency, inp_tok, out_tok, tps
@@ -167,7 +160,6 @@ def _invoke_mistral(prompt: str):
     return text, latency, inp_tok, out_tok, tps
 
 
-# LLMObs decorators — makes each call visible in Datadog LLM Observability
 @llm(model_provider="bedrock", model_name="claude-3-haiku")
 def call_haiku(prompt):
     return _invoke_haiku(prompt)
@@ -182,7 +174,43 @@ def call_mistral(prompt):
 
 CALLERS = {"haiku": call_haiku, "llama3": call_llama3, "mistral": call_mistral}
 
+# ── Optional local Ollama model ────────────────────────────────────────────────
+OLLAMA_AVAILABLE = False
+try:
+    import ollama as ollama_client
+    # Quick ping to see if Ollama is running
+    ollama_client.chat(model="qwen2:0.5b", messages=[{"role": "user", "content": "hi"}])
 
+    MODEL_IDS["local"]     = "qwen2:0.5b"
+    MODEL_PRICING["local"] = 0.0
+    IS_LOCAL["local"]      = True
+    models["local"] = {
+        "latency": None, "cost": None, "reliability": None,
+        "input_tokens": None, "output_tokens": None, "tokens_per_sec": None,
+        "error_rate": 0.0, "total_calls": 0, "total_errors": 0
+    }
+
+    @llm(model_provider="ollama", model_name="qwen2:0.5b")
+    def call_local(prompt):
+        start    = time.time()
+        response = ollama_client.chat(
+            model="qwen2:0.5b",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        latency  = time.time() - start
+        inp_tok  = response.get("prompt_eval_count", 0)
+        out_tok  = response.get("eval_count", 0)
+        tps      = out_tok / latency if latency > 0 else 0
+        return response["message"]["content"], latency, inp_tok, out_tok, tps
+
+    CALLERS["local"] = call_local
+    OLLAMA_AVAILABLE = True
+    print("[CONDUCTOR-AWS] Ollama detected — local model (qwen2:0.5b) added to pool.")
+except Exception:
+    print("[CONDUCTOR-AWS] Ollama not available — running cloud-only (3 Bedrock models).")
+
+
+# ── Strands Agent ──────────────────────────────────────────────────────────────
 strands_agent = Agent(
     model=BedrockModel(
         model_id=MODEL_IDS["haiku"],
@@ -191,11 +219,10 @@ strands_agent = Agent(
     system_prompt="You are Conductor, an intelligent LLM router that selects the best model based on performance metrics."
 )
 
-# ── Benchmark ──────────────────────────────────────────────────────────────────
 
 def benchmark_all_models():
     global last_benchmark_time
-    print("\n[CONDUCTOR-AWS] Benchmarking Bedrock models...")
+    print("\n[CONDUCTOR-AWS] Benchmarking models...")
     probe = "say hi in one word"
 
     for name in models:
@@ -205,12 +232,12 @@ def benchmark_all_models():
             cost_score    = calculate_cost_score(name, inp, out)
             cost_usd      = ((inp + out) / 1_000_000) * MODEL_PRICING[name]
 
-            models[name]["latency"]       = round(latency_score, 3)
-            models[name]["cost"]          = cost_score
-            models[name]["reliability"]   = 1.0
-            models[name]["input_tokens"]  = inp
-            models[name]["output_tokens"] = out
-            models[name]["tokens_per_sec"]= round(tps, 1)
+            models[name]["latency"]        = round(latency_score, 3)
+            models[name]["cost"]           = cost_score
+            models[name]["reliability"]    = 1.0
+            models[name]["input_tokens"]   = inp
+            models[name]["output_tokens"]  = out
+            models[name]["tokens_per_sec"] = round(tps, 1)
 
             report_to_datadog(name, latency, inp, out, cost_usd, tps, success=True)
             print(f"  {name}: latency={latency:.2f}s | {inp}in/{out}out tok | {tps:.0f} tok/s | cost_score={cost_score:.3f}")
@@ -226,8 +253,6 @@ def benchmark_all_models():
 
     print("[CONDUCTOR-AWS] Benchmark complete.\n")
 
-
-# ── Metric update + re-benchmark trigger ───────────────────────────────────────
 
 def update_metrics(model_name, latency, success, inp, out, tps, weights):
     global last_benchmark_time
@@ -275,8 +300,6 @@ def update_metrics(model_name, latency, success, inp, out, tps, weights):
         benchmark_all_models()
 
 
-# ── Main chat function (called by FastAPI in api.py) ──────────────────────────
-
 def chat(prompt: str, weights: dict) -> dict:
     chosen, scores = score_models(weights)
     print(f"[CONDUCTOR-AWS] Routing to → {chosen.upper()}")
@@ -285,11 +308,12 @@ def chat(prompt: str, weights: dict) -> dict:
         response, latency, inp, out, tps = CALLERS[chosen](prompt)
         update_metrics(chosen, latency, True, inp, out, tps, weights)
         return {
-            "response":     response,
-            "model_chosen": chosen,
-            "scores":       {k: round(v, 3) for k, v in scores.items()},
-            "latency":      round(latency, 3),
-            "tokens":       {"input": inp, "output": out}
+            "response":         response,
+            "model_chosen":     chosen,
+            "scores":           {k: round(v, 3) for k, v in scores.items()},
+            "latency":          round(latency, 3),
+            "tokens":           {"input": inp, "output": out},
+            "ollama_available": OLLAMA_AVAILABLE,
         }
 
     except Exception as e:
@@ -299,9 +323,10 @@ def chat(prompt: str, weights: dict) -> dict:
         response, latency, inp, out, tps = CALLERS[fallback](prompt)
         update_metrics(fallback, latency, True, inp, out, tps, weights)
         return {
-            "response":     response,
-            "model_chosen": f"{fallback} (fallback from {chosen})",
-            "scores":       {k: round(v, 3) for k, v in scores.items()},
-            "latency":      round(latency, 3),
-            "tokens":       {"input": inp, "output": out}
+            "response":         response,
+            "model_chosen":     f"{fallback} (fallback from {chosen})",
+            "scores":           {k: round(v, 3) for k, v in scores.items()},
+            "latency":          round(latency, 3),
+            "tokens":           {"input": inp, "output": out},
+            "ollama_available": OLLAMA_AVAILABLE,
         }

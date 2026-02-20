@@ -1,6 +1,8 @@
 """
 Conductor AWS — FastAPI endpoint
 POST /chat → scores Bedrock models, routes to winner, returns response + metadata
+POST /break/{model_name} → simulates model degradation for demo
+POST /restore/{model_name} → restores model and re-benchmarks
 """
 
 from fastapi import FastAPI, HTTPException
@@ -8,10 +10,9 @@ from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 import uvicorn
 
-from router_agent import benchmark_all_models, chat
+from router_agent import benchmark_all_models, chat, models, consecutive_drops
 
 
-# ── Startup: benchmark all models before accepting requests ───────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[CONDUCTOR-AWS] Starting up — running initial benchmark...")
@@ -19,14 +20,9 @@ async def lifespan(app: FastAPI):
     print("[CONDUCTOR-AWS] Ready to route requests.")
     yield
 
-app = FastAPI(
-    title="Conductor AWS",
-    description="Intelligent LLM router using AWS Bedrock models",
-    lifespan=lifespan
-)
+app = FastAPI(title="Conductor AWS", lifespan=lifespan)
 
 
-# ── Request / Response schemas ─────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     prompt:        str   = Field(..., description="The user prompt to route")
     latency_w:     float = Field(default=0.4, ge=0, description="Weight for latency (0-10)")
@@ -35,15 +31,6 @@ class ChatRequest(BaseModel):
     local_pref_w:  float = Field(default=0.1, ge=0, description="Weight for local preference (0-10)")
 
 
-class ChatResponse(BaseModel):
-    response:     str
-    model_chosen: str
-    scores:       dict
-    latency:      float
-    tokens:       dict
-
-
-# ── Routes ─────────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {"status": "ok", "service": "Conductor AWS LLM Router"}
@@ -54,24 +41,43 @@ def health():
     return {"status": "healthy"}
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat")
 def route_chat(req: ChatRequest):
-    # Normalize weights so they always sum to 1
     total = req.latency_w + req.cost_w + req.reliability_w + req.local_pref_w
     if total == 0:
         raise HTTPException(status_code=400, detail="All weights cannot be zero")
 
     weights = {
-        "latency":    req.latency_w     / total,
-        "cost":       req.cost_w        / total,
-        "reliability":req.reliability_w / total,
-        "local_pref": req.local_pref_w  / total,
+        "latency":     req.latency_w     / total,
+        "cost":        req.cost_w        / total,
+        "reliability": req.reliability_w / total,
+        "local_pref":  req.local_pref_w  / total,
     }
 
-    result = chat(req.prompt, weights)
-    return result
+    return chat(req.prompt, weights)
 
 
-# ── Run ────────────────────────────────────────────────────────────────────────
+@app.post("/break/{model_name}")
+def break_model(model_name: str):
+    """Simulate model degradation — slams latency and reliability scores."""
+    if model_name not in models:
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found. Available: {list(models.keys())}")
+    models[model_name]["latency"]     = 0.01
+    models[model_name]["reliability"] = 0.1
+    consecutive_drops[model_name]     = 0
+    print(f"[CONDUCTOR-AWS] 💥 {model_name} manually degraded for demo.")
+    return {"broken": model_name, "message": f"{model_name} degraded — Conductor will reroute on next request."}
+
+
+@app.post("/restore/{model_name}")
+def restore_model(model_name: str):
+    """Restore a broken model by re-benchmarking everything."""
+    if model_name not in models:
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found.")
+    print(f"[CONDUCTOR-AWS] 🔄 Restoring {model_name} — re-benchmarking all models...")
+    benchmark_all_models()
+    return {"restored": model_name, "message": "All models re-benchmarked."}
+
+
 if __name__ == "__main__":
     uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=False)
