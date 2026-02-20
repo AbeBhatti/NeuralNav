@@ -1,7 +1,7 @@
 """
 Conductor AWS — FastAPI endpoint
-POST /chat → scores Bedrock models, routes to winner, returns response + metadata
-POST /break/{model_name} → simulates model degradation for demo
+POST /chat  → routes to best model, returns response + metadata
+POST /break/{model_name}   → simulates model degradation for demo
 POST /restore/{model_name} → restores model and re-benchmarks
 """
 
@@ -59,7 +59,6 @@ def route_chat(req: ChatRequest):
 
 @app.post("/break/{model_name}")
 def break_model(model_name: str):
-    """Simulate model degradation — slams latency and reliability scores."""
     if model_name not in models:
         raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found. Available: {list(models.keys())}")
     models[model_name]["latency"]     = 0.01
@@ -71,10 +70,9 @@ def break_model(model_name: str):
 
 @app.post("/restore/{model_name}")
 def restore_model(model_name: str):
-    """Restore a broken model by re-benchmarking everything."""
     if model_name not in models:
         raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found.")
-    print(f"[CONDUCTOR-AWS] 🔄 Restoring {model_name} — re-benchmarking all models...")
+    print(f"[CONDUCTOR-AWS] 🔄 Restoring — re-benchmarking all models...")
     benchmark_all_models()
     return {"restored": model_name, "message": "All models re-benchmarked."}
 

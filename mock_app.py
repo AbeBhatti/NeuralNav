@@ -3,6 +3,13 @@ Mock Project — "NeuralNav Assistant"
 A simple Flask app that would normally call OpenAI directly.
 Instead it calls Conductor's POST /chat endpoint — proving Conductor
 is a drop-in replacement for any LLM-powered project.
+
+New features:
+- Shared conversation memory across all models (no context loss on model switch)
+- If cost weight is high → local model summarizes history (free)
+- If cost weight is low  → last 3 turns sent raw (more accurate, slightly pricier)
+- Dynamic benchmark cooldown shown in UI
+- Failure simulation buttons
 """
 
 from flask import Flask, request, jsonify, render_template_string
@@ -20,6 +27,49 @@ DEFAULT_WEIGHTS = {
     "local_pref_w":  0,
 }
 
+# ── Shared conversation memory ─────────────────────────────────────────────────
+conversation_history = []
+
+
+def summarize_with_local(history_text: str) -> str:
+    """Use local Ollama model to summarize history — free, no cloud cost."""
+    try:
+        import ollama
+        result = ollama.chat(
+            model="qwen2:0.5b",
+            messages=[{
+                "role": "user",
+                "content": f"Summarize this conversation in 2 sentences to use as context:\n{history_text}"
+            }]
+        )
+        return result["message"]["content"]
+    except Exception:
+        # Ollama not available — fall back to last 4 raw lines
+        lines = history_text.strip().split("\n")
+        return "\n".join(lines[-4:])
+
+
+def build_context(cost_w_normalized: float) -> str:
+    """
+    Build conversation context to send with each prompt.
+    High cost weight → summarize with local model (free).
+    Low cost weight  → send raw last 3 turns (more accurate).
+    """
+    if not conversation_history:
+        return ""
+
+    history_text = "\n".join(conversation_history)
+
+    if cost_w_normalized >= 0.4:
+        # Cost-conscious: use local model to compress history
+        summary = summarize_with_local(history_text)
+        return f"[Conversation summary]: {summary}\n\n"
+    else:
+        # Latency/quality focused: send raw recent history
+        recent = "\n".join(conversation_history[-6:])
+        return f"[Recent conversation]:\n{recent}\n\n"
+
+
 HTML = """
 <!DOCTYPE html>
 <html>
@@ -36,14 +86,15 @@ HTML = """
         .meta { color: #888; font-size: 12px; margin-top: 6px; padding: 6px 10px; background: #111; border-radius: 6px; display: inline-block; }
         .model-badge { display: inline-block; background: #7c3aed; color: white; padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; margin-right: 6px; }
         .model-badge.fallback { background: #b45309; }
-        .latency-badge { display: inline-block; background: #1e3a2f; color: #34d399; padding: 3px 8px; border-radius: 12px; font-size: 11px; }
+        .latency-badge { display: inline-block; background: #1e3a2f; color: #34d399; padding: 3px 8px; border-radius: 12px; font-size: 11px; margin-right: 4px; }
+        .cooldown-badge { display: inline-block; background: #1e2535; color: #60a5fa; padding: 3px 8px; border-radius: 12px; font-size: 11px; }
         input[type=text] { width: 100%; padding: 10px; background: #1a1a1a; border: 1px solid #333; color: #eee; border-radius: 6px; font-size: 15px; box-sizing: border-box; }
         .send-btn { padding: 10px 24px; background: #7c3aed; color: white; border: none; border-radius: 6px; cursor: pointer; margin-top: 8px; font-size: 15px; }
         .send-btn:hover { background: #6d28d9; }
         .panel { background: #1a1a1a; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
         .panel h3 { margin-top: 0; color: #a78bfa; font-size: 14px; }
         .weight-row { display: flex; align-items: center; gap: 12px; margin: 8px 0; }
-        .weight-row label { width: 140px; font-size: 13px; color: #aaa; }
+        .weight-row label { width: 150px; font-size: 13px; color: #aaa; }
         .weight-row input[type=range] { flex: 1; accent-color: #7c3aed; }
         .weight-row span { width: 20px; text-align: right; font-size: 13px; color: #eee; }
         .local-section { margin-top: 14px; padding-top: 14px; border-top: 1px solid #333; }
@@ -53,6 +104,7 @@ HTML = """
         .dl-status { font-size: 12px; color: #888; margin-left: 10px; }
         #local-row { display: none; }
         .scores { font-size: 11px; color: #555; margin-top: 3px; }
+        .memory-tag { font-size: 11px; color: #6366f1; margin-top: 2px; }
         .break-btns { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
         .break-btn { padding: 7px 14px; background: #3a1e1e; color: #f87171; border: 1px solid #f87171; border-radius: 6px; cursor: pointer; font-size: 12px; }
         .break-btn:hover { background: #f87171; color: #000; }
@@ -159,10 +211,11 @@ HTML = """
 
             const localRow = document.getElementById('local-row');
             const localActive = localRow.style.display !== 'none';
+            const costW = parseInt(document.getElementById('cost_w').value);
 
             const weights = {
                 latency_w:     parseInt(document.getElementById('latency_w').value),
-                cost_w:        parseInt(document.getElementById('cost_w').value),
+                cost_w:        costW,
                 reliability_w: parseInt(document.getElementById('reliability_w').value),
                 local_pref_w:  localActive ? parseInt(document.getElementById('local_pref_w').value) : 0,
             };
@@ -187,13 +240,19 @@ HTML = """
                 .map(([k, v]) => `${k}: ${v}`)
                 .join(' · ');
 
+            const memoryMode = costW >= 5
+                ? '🖥 memory: local summarization (free)'
+                : '☁️ memory: raw context (accurate)';
+
             chat.innerHTML += `
                 <div class="message">
                     <span class="assistant">Assistant:</span> ${data.response}
                     <div class="meta">
                         <span class="${badgeClass}">→ ${data.model_chosen}</span>
                         <span class="latency-badge">${data.latency}s</span>
+                        <span class="cooldown-badge">⏱ benchmark every ${data.benchmark_cooldown}s</span>
                         <div class="scores">scores: ${scoreStr}</div>
+                        <div class="memory-tag">${memoryMode}</div>
                     </div>
                 </div>`;
             chat.scrollTop = chat.scrollHeight;
@@ -238,8 +297,6 @@ def break_model(model_name):
 
 @app.route("/restore/all", methods=["POST"])
 def restore_all():
-    # Restore each model by hitting the restore endpoint for any one of them
-    # (restore triggers full re-benchmark)
     res = requests.post(f"{CONDUCTOR_URL}/restore/haiku")
     return jsonify(res.json())
 
@@ -248,15 +305,40 @@ def restore_all():
 def ask():
     body    = request.json
     prompt  = body.get("prompt", "")
+    cost_w  = body.get("cost_w", DEFAULT_WEIGHTS["cost_w"])
+
+    # Normalize cost weight for memory decision (same normalization as api.py)
+    total = (body.get("latency_w", 5) + cost_w +
+             body.get("reliability_w", 2) + body.get("local_pref_w", 0))
+    cost_w_normalized = cost_w / total if total > 0 else 0
+
+    # Build shared context — method depends on cost priority
+    context = build_context(cost_w_normalized)
+    full_prompt = f"{context}User: {prompt}" if context else prompt
+
+    # Store in shared memory
+    conversation_history.append(f"User: {prompt}")
+
     payload = {
-        "prompt":        prompt,
+        "prompt":        full_prompt,
         "latency_w":     body.get("latency_w",     DEFAULT_WEIGHTS["latency_w"]),
-        "cost_w":        body.get("cost_w",         DEFAULT_WEIGHTS["cost_w"]),
+        "cost_w":        cost_w,
         "reliability_w": body.get("reliability_w",  DEFAULT_WEIGHTS["reliability_w"]),
         "local_pref_w":  body.get("local_pref_w",   DEFAULT_WEIGHTS["local_pref_w"]),
     }
+
     response = requests.post(f"{CONDUCTOR_URL}/chat", json=payload)
-    return jsonify(response.json())
+    data = response.json()
+
+    # Store assistant response in shared memory
+    conversation_history.append(f"Assistant: {data.get('response', '')}")
+
+    # Keep memory bounded — last 20 turns max
+    if len(conversation_history) > 20:
+        conversation_history.pop(0)
+        conversation_history.pop(0)
+
+    return jsonify(data)
 
 
 if __name__ == "__main__":

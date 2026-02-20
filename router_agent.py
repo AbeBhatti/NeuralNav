@@ -59,8 +59,24 @@ models = {
 
 initial_scores    = {}
 consecutive_drops = {}
-REBENCHMARK_COOLDOWN = 60
-last_benchmark_time  = 0
+last_benchmark_time = 0
+
+
+def get_benchmark_cooldown(weights):
+    """
+    Dynamic cooldown based on cost weight.
+    High cost priority → benchmark less often (save API calls).
+    Low cost priority  → benchmark aggressively (always fresh data).
+
+    Configurable per project type — e.g.:
+      - Fintech / cost-sensitive: set BASE=120, MAXIMUM=600
+      - Trading / latency-critical: set BASE=15, MAXIMUM=60
+    """
+    BASE    = 20   # seconds minimum  (kept low for demo)
+    MAXIMUM = 90   # seconds maximum  (kept low for demo)
+    cost_w  = weights.get("cost", 0)  # already normalized 0-1
+    cooldown = BASE + (cost_w * (MAXIMUM - BASE))
+    return cooldown
 
 
 def calculate_cost_score(model_name, input_tokens, output_tokens):
@@ -100,10 +116,10 @@ def score_models(weights):
             continue
         local_bonus = 0.3 if IS_LOCAL[name] else 0.0
         score = (
-            metrics["latency"]      * weights["latency"] +
-            metrics["cost"]         * weights["cost"] +
-            metrics["reliability"]  * weights["reliability"] +
-            local_bonus             * weights.get("local_pref", 0)
+            metrics["latency"]     * weights["latency"] +
+            metrics["cost"]        * weights["cost"] +
+            metrics["reliability"] * weights["reliability"] +
+            local_bonus            * weights.get("local_pref", 0)
         )
         scores[name] = score
     return max(scores, key=scores.get), scores
@@ -178,7 +194,6 @@ CALLERS = {"haiku": call_haiku, "llama3": call_llama3, "mistral": call_mistral}
 OLLAMA_AVAILABLE = False
 try:
     import ollama as ollama_client
-    # Quick ping to see if Ollama is running
     ollama_client.chat(model="qwen2:0.5b", messages=[{"role": "user", "content": "hi"}])
 
     MODEL_IDS["local"]     = "qwen2:0.5b"
@@ -294,15 +309,18 @@ def update_metrics(model_name, latency, success, inp, out, tps, weights):
     else:
         consecutive_drops[model_name] = 0
 
-    cooldown_passed = (time.time() - last_benchmark_time) > REBENCHMARK_COOLDOWN
+    # Dynamic cooldown — high cost weight = benchmark less often
+    cooldown = get_benchmark_cooldown(weights)
+    cooldown_passed = (time.time() - last_benchmark_time) > cooldown
+
     if consecutive_drops.get(model_name, 0) >= 2 and cooldown_passed:
-        print(f"\n[CONDUCTOR-AWS] {model_name} degraded twice. Re-benchmarking...")
+        print(f"\n[CONDUCTOR-AWS] {model_name} degraded. Cooldown was {cooldown:.0f}s. Re-benchmarking...")
         benchmark_all_models()
 
 
 def chat(prompt: str, weights: dict) -> dict:
     chosen, scores = score_models(weights)
-    print(f"[CONDUCTOR-AWS] Routing to → {chosen.upper()}")
+    print(f"[CONDUCTOR-AWS] Routing to → {chosen.upper()} (cooldown={get_benchmark_cooldown(weights):.0f}s)")
 
     try:
         response, latency, inp, out, tps = CALLERS[chosen](prompt)
@@ -314,6 +332,7 @@ def chat(prompt: str, weights: dict) -> dict:
             "latency":          round(latency, 3),
             "tokens":           {"input": inp, "output": out},
             "ollama_available": OLLAMA_AVAILABLE,
+            "benchmark_cooldown": round(get_benchmark_cooldown(weights)),
         }
 
     except Exception as e:
@@ -329,4 +348,5 @@ def chat(prompt: str, weights: dict) -> dict:
             "latency":          round(latency, 3),
             "tokens":           {"input": inp, "output": out},
             "ollama_available": OLLAMA_AVAILABLE,
+            "benchmark_cooldown": round(get_benchmark_cooldown(weights)),
         }
