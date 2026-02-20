@@ -11,6 +11,8 @@ import boto3
 from ddtrace.llmobs import LLMObs
 from ddtrace.llmobs.decorators import llm
 from datadog import initialize, statsd
+from strands import Agent
+from strands.models.bedrock import BedrockModel
 
 # ── Datadog init (mirrors router.py exactly) ───────────────────────────────────
 LLMObs.enable(
@@ -180,6 +182,14 @@ def call_mistral(prompt):
 
 CALLERS = {"haiku": call_haiku, "llama3": call_llama3, "mistral": call_mistral}
 
+
+strands_agent = Agent(
+    model=BedrockModel(
+        model_id=MODEL_IDS["haiku"],
+        region_name=os.getenv("AWS_REGION", "us-west-2")
+    ),
+    system_prompt="You are Conductor, an intelligent LLM router that selects the best model based on performance metrics."
+)
 
 # ── Benchmark ──────────────────────────────────────────────────────────────────
 
