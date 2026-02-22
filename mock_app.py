@@ -51,28 +51,10 @@ def summarize_with_local(history_text: str) -> str:
 
 
 def build_context(cost_w_normalized: float, latency_w_normalized: float):
-    """
-    Build conversation context to send with each prompt.
-    High latency weight → skip context entirely (fastest).
-    High cost weight → summarize with local model (free).
-    Low cost weight  → send raw last 3 turns (more accurate).
-    """
     if not conversation_history:
         return "", "no_history"
-
-    if latency_w_normalized >= 0.45:
-        return "", "latency_fast_path"
-
-    history_text = "\n".join(conversation_history)
-
-    if cost_w_normalized >= 0.4:
-        # Cost-conscious: use local model to compress history
-        summary = summarize_with_local(history_text)
-        return f"[Conversation summary]: {summary}\n\n", "local_summary"
-    else:
-        # Latency/quality focused: send raw recent history
-        recent = "\n".join(conversation_history[-6:])
-        return f"[Recent conversation]:\n{recent}\n\n", "raw_recent"
+    recent = "\n".join(conversation_history[-6:])
+    return f"Here is the recent conversation for context only — do not repeat it:\n{recent}\n\nNow respond to the user's new message: ", "raw_recent"
 
 
 def process_chat_request(body):
@@ -87,7 +69,7 @@ def process_chat_request(body):
     latency_w_normalized = latency_w / total if total > 0 else 0
 
     context, context_mode = build_context(cost_w_normalized, latency_w_normalized)
-    full_prompt = f"{context}User: {prompt}" if context else prompt
+    full_prompt = f"{context}{prompt}" if context else prompt
 
     conversation_history.append(f"User: {prompt}")
 
